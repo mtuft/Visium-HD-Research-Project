@@ -1,0 +1,1595 @@
+# Reproducibility and Validation Pipeline
+---
+title: "VisiumHD Reproducibility & Validation Pipeline"
+author: "Michael Tuft"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      error = TRUE)
+```
+
+```{r config-input}
+INPUT_SPACERANGER <- NULL
+INPUT_RDS  <- "/scratch/prj/mmg_grp_single_cell_lab/projects/michael/shiny_app/data/debug_processed.rds"
+BIN_SIZE   <- "square_008um"   # used only when INPUT_SPACERANGER is set
+```
+
+### Concordance validation
+
+Set `VALIDATION_RDS` to the `clustered.rds` from the validated app session to produce a side-by-side UMAP and confusion matrix confirming 100% concordance. Set to `NULL` to skip.
+
+```{r config-concordance}
+VALIDATION_RDS <- "/scratch/prj/mmg_grp_single_cell_lab/projects/michael/shiny_app/results/063585eb11b638bc0787d8c546435d0c/clustered.rds"
+OUTPUT_DIR     <- "/scratch/prj/mmg_grp_single_cell_lab/projects/michael/pipeline_output"
+```
+
+### Azimuth validation
+
+Set `AZIMUTH_APP_RDS` to the `azimuth.rds` from the validated app session. The pipeline will run Azimuth independently and compare `predicted.class` and `predicted.subclass` labels spot-by-spot. The reference must match the one used in the app session.
+
+```{r config-azimuth}
+AZIMUTH_APP_RDS   <- "/scratch/prj/mmg_grp_single_cell_lab/projects/michael/shiny_app/results/063585eb11b638bc0787d8c546435d0c/azimuth.rds"
+AZIMUTH_REFERENCE <- "mousecortexref"
+```
+
+### RCTD validation
+
+Set `RCTD_APP_RDS` to the `rctd.rds` (or `azimuth_rctd.rds`) from the validated app session. The pipeline will run RCTD independently and compare `first_type` assignments spot-by-spot.
+
+```{r config-rctd}
+RCTD_APP_RDS       <- "/scratch/prj/mmg_grp_single_cell_lab/projects/michael/shiny_app/results/063585eb11b638bc0787d8c546435d0c/azimuth_rctd.rds"
+RCTD_REFERENCE     <- "/scratch/prj/mmg_grp_single_cell_lab/projects/michael/data/zeisel_brain_ref.Rds"
+RCTD_CELL_TYPE_COL <- "cell_type"
+RCTD_MODE          <- "doublet"
+RCTD_MAX_CORES     <- 4L
+```
+
+### BANKSY rotation validation
+
+Set `RUN_BANKSY_ROTATION` to `TRUE` to enable Section 12. The pipeline will re-run BANKSY clustering on a version of the data with 90° rotated spatial coordinates and compare cluster assignments barcode-by-barcode against the original run. Set to `FALSE` to skip.
+
+```{r config-banksy-rotation}
+RUN_BANKSY_ROTATION <- TRUE
+BANKSY_ROTATION_DEG <- 90L   # rotation angle: 90, 180, or 270
+
+# BANKSY parameters — must match the values used in the app session
+BANKSY_LAMBDA     <- 0.2    # spatial weighting (0 = transcriptomic only,
+                             # 1 = fully spatial); 0.2 is the Shiny app default
+BANKSY_RESOLUTION <- 0.6    # clustering resolution for BANKSY run
+BANKSY_NPCS       <- 20L    # PCs used for BANKSY neighbourhood computation
+```
+
+### QC filtering thresholds
+
+Values taken directly from the validated Shiny app session (stored in `clustered.rds@misc[["qc_params"]]`). These are the 5th and 95th percentile cutoffs of the nCounts and nFeatures distributions.
+
+```{r config-qc}
+MIN_COUNTS   <- 75     # mc_min — 5th percentile of nCount_Spatial
+MAX_COUNTS   <- 580    # mc_max — 95th percentile of nCount_Spatial
+MIN_FEATURES <- 61     # mf_min — 5th percentile of nFeature_Spatial
+MAX_FEATURES <- 440    # mf_max — 95th percentile of nFeature_Spatial
+MITO_ENABLED <- FALSE  # mt_used = NA in validated session
+```
+
+### Normalisation, PCA, and clustering
+
+"normalize" = NormalizeData + FindVariableFeatures + ScaleData
+
+Validated session used log-normalisation (norm_method = "normalize")
+
+N_PCS_COMPUTE: total PCs computed by RunPCA (upper bound for elbow plot)
+
+N_PCS_USE: PCs retained for UMAP and clustering
+
+Validated session: n_pcs_use = 17
+
+Validated session: resolution = 1.0, producing 18 clusters
+
+Sketch size = 7,195 spots (10% of 71,951 post-QC spots)
+
+```{r config-analysis}
+NORM_METHOD   <- "normalize"  # NormalizeData + FindVariableFeatures + ScaleData
+N_PCS_COMPUTE <- 50L          # upper bound for elbow plot inspection
+N_PCS_USE     <- 17L          # validated value — set after inspecting elbow plot
+RESOLUTION    <- 1.0          # validated value — produces 18 clusters
+```
+
+## Section 1 — Setup
+
+**R package loading.** Five core packages are loaded: `Seurat` (the main single-cell/spatial analysis framework), `SeuratObject` (the underlying data structure definitions), `ggplot2` (all plotting), `patchwork` (combining multiple ggplots into one figure), and `dplyr` (data manipulation with `%>%`, `group_by`, `summarise` etc.).
+
+**BPCells check.** `requireNamespace("BPCells", quietly = TRUE)` checks whether the BPCells package is installed and stores the result in `BPCELLS_AVAILABLE`. BPCells is the package that converts count matrices to bit-packed on-disk format so they don't need to fit entirely in RAM. It is not loaded here — just checked.
+
+**`detect_spatial_assay`** helper function**.** This is a custom function defined here and used in sections 4 and 11. It takes a Seurat object and returns the name of the correct assay to use. The logic is: if any assay name starts with "Spatial" (case-insensitive), return that first. If not, fall back to "RNA". If neither exists, return whatever the first assay is. The function uses `Assays(obj)` to list all assays and `grep("^Spatial", ...)` to search for spatial ones. The `^` character means "starts with" in regex.
+
+**Directory creation.** `dir.create()` creates the output directory and its `plots/` and `rds/` subdirectories. `showWarnings = FALSE` means it won't complain if they already exist. `recursive = TRUE` means it creates any missing parent directories.
+
+### Worker constants
+
+These must match `worker.R`
+
+```{r setup-constants}
+PIPELINE_SEED  <- 42L
+SKETCH_N_CELLS <- 50000L   # target sketch size; capped at 10% of spots if smaller
+```
+
+### Output directories
+
+```{r setup-dirs}
+dir.create(OUTPUT_DIR,                     showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUTPUT_DIR, "plots"), showWarnings = FALSE)
+dir.create(file.path(OUTPUT_DIR, "rds"),   showWarnings = FALSE)
+```
+
+### Required packages
+
+```{r setup-packages}
+required_pkgs <- c("Seurat", "SeuratObject", "ggplot2", "patchwork", "dplyr")
+missing_pkgs  <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
+if (length(missing_pkgs) > 0)
+  stop("Missing packages: ", paste(missing_pkgs, collapse = ", "))
+
+library(Seurat)
+library(SeuratObject)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+
+cat("Seurat version:", as.character(packageVersion("Seurat")), "\n")
+```
+
+### Optional packages (BPCells)
+
+```{r setup-optional}
+BPCELLS_AVAILABLE <- requireNamespace("BPCells", quietly = TRUE)
+cat("BPCells available:", BPCELLS_AVAILABLE, "\n")
+```
+
+### Helper: detect spatial assay
+
+Picks the most appropriate assay — prefers any assay starting with "Spatial", falls back to "RNA", then the first available assay. Mirrors `worker.R` lines 95–101. Picks the most appropriate assay from a Seurat object by preferring any assay whose name starts with “Spatial,” otherwise falling back to “RNA,” and if neither exists, returning the first assay in the object.
+
+```{r setup-helper}
+detect_spatial_assay <- function(obj) {
+  assays  <- Assays(obj)
+  spatial <- grep("^Spatial", assays, ignore.case = TRUE, value = TRUE)
+  if (length(spatial) > 0) return(spatial[1])
+  if ("RNA" %in% assays)   return("RNA")
+  assays[1]
+}
+```
+
+## Section 2 — Data Loading
+
+```{r load-data}
+# If a Spaceranger directory is provided, load raw Visium data
+if (!is.null(INPUT_SPACERANGER) && nzchar(INPUT_SPACERANGER)) {
+
+  # Construct path to the correct bin size folder (e.g., spaceranger output / spatial / 1um)
+  sq_dir <- file.path(INPUT_SPACERANGER, BIN_SIZE)
+
+  # Validate that the directory exists
+  if (!dir.exists(sq_dir))
+    stop("Spaceranger bin directory not found: ", sq_dir,
+         "\nCheck INPUT_SPACERANGER and BIN_SIZE in CONFIG.")
+
+  cat("Loading Spaceranger output from:", sq_dir, "\n")
+
+  # Load 10X Visium data (counts + image + coordinates)
+  obj <- Seurat::Load10X_Spatial(
+    data.dir = sq_dir,
+    filename = "filtered_feature_bc_matrix.h5",
+    assay    = "Spatial"
+  )
+
+  cat("Raw Spaceranger data loaded.\n")
+
+# Otherwise, if an RDS file is provided, load the pre‑processed Seurat object
+} else if (!is.null(INPUT_RDS) && nzchar(INPUT_RDS)) {
+
+  # Ensure the RDS file exists
+  if (!file.exists(INPUT_RDS))
+    stop("Input RDS not found: ", INPUT_RDS)
+
+  cat("Loading pre-processed RDS:", INPUT_RDS, "\n")
+
+  # Load the saved Seurat object
+  obj <- readRDS(INPUT_RDS)
+
+# If neither input source is provided, stop with an error
+} else {
+  stop("Set either INPUT_SPACERANGER or INPUT_RDS in the CONFIG section.")
+}
+
+# Summary of loaded dataset
+
+cat("Spots loaded:   ", ncol(obj), "\n")   # number of barcodes / spots
+cat("Genes detected: ", nrow(obj), "\n")   # number of genes/features
+cat("Default assay:  ", DefaultAssay(obj), "\n")
+cat("Assays present: ", paste(Assays(obj), collapse = ", "), "\n")
+```
+
+### Reset reductions and detect QC columns
+
+Strips existing reductions and graphs so no stale embeddings contaminate the new run, then identifies the count and feature metadata columns. Mirrors `worker.R` `processPCA` lines 130–133. Resets reductions and graphs, simplifies the Seurat object, merges assay layers, identifies QC columns, and computes mitochondrial percentages if they are missing. From worker.R processPCA, lines 130-133
+
+```{r load-reset}
+# Reset dimensionality reductions (PCA, UMAP, etc.)
+obj@reductions <- list()
+
+# Reset neighbour graphs (SNN, KNN, etc.)
+obj@graphs <- list()
+
+# Strip object down to essential assay data and metadata
+# Removes unnecessary layers, reductions, graphs, and misc slots
+obj <- DietSeurat(obj, assays = DefaultAssay(obj), graphs = NULL)
+
+# Join Seurat v5 assay layers into a single matrix (required for downstream steps)
+obj <- JoinLayers(obj, assay = DefaultAssay(obj))
+
+# Extract metadata for QC feature detection
+meta <- obj@meta.data
+
+# Identify the feature and count columns (e.g., nFeature_Spatial, nCount_Spatial)
+feat_col  <- grep("^nFeature", colnames(meta), value = TRUE)[1]
+count_col <- grep("^nCount",   colnames(meta), value = TRUE)[1]
+
+cat("Count column:   ", count_col, "\n")
+cat("Feature column: ", feat_col,  "\n")
+
+# If mitochondrial percentage is required but missing, compute it now
+if (!("percent.mt" %in% colnames(meta)) && MITO_ENABLED) {
+  cat("percent.mt not found — computing now.\n")
+
+  # Calculate mitochondrial percentage using gene names starting with mt- or MT-
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^mt-|^MT-")
+
+  # Refresh metadata to include the new column
+  meta <- obj@meta.data
+}
+```
+
+## Section 3 — QC Filtering
+
+### Pre-filter QC violin plot
+
+```{r qc-prefilter-plot}
+pre_features <- c(count_col, feat_col)
+
+# If mitochondrial QC is enabled and percent.mt exists in metadata,
+# include it as an additional QC feature for pre‑filter violin plots
+if (MITO_ENABLED && "percent.mt" %in% colnames(meta))
+  pre_features <- c(pre_features, "percent.mt")
+
+# Number of QC panels to display
+n_pre_panels <- length(pre_features)
+
+# Build pre‑filter QC violin plots
+p_pre <- VlnPlot(
+    obj,
+    features = pre_features,   # QC metrics to visualise
+    ncol     = n_pre_panels,   # arrange all violins in one row
+    pt.size  = 0               # hide individual points for cleaner violins
+  ) &
+  theme(
+    axis.title.x = element_blank(),          # remove x‑axis titles
+    axis.text.x  = element_blank(),          # hide x‑axis labels
+    axis.title.y = element_text(size = 9, colour = "#444")   # style y‑axis titles
+  )
+
+# Save pre‑filter QC plot to PDF (wider if 3 panels)
+ggsave(
+  file.path(OUTPUT_DIR, "plots", "01_qc_prefilter.pdf"),
+  plot   = p_pre,
+  width  = if (n_pre_panels == 3) 10 else 7,
+  height = 4
+)
+
+cat("Saved: 01_qc_prefilter.pdf\n")
+
+# Display inline in knitted report
+p_pre
+```
+
+### Apply filters
+
+Filters cells based on count, feature, and mitochondrial thresholds, reports how many were removed, ensures enough remain, and then creates a cleaned Seurat object containing only the retained cells.
+
+```{r qc-filter}
+keep <- meta[[count_col]] >= MIN_COUNTS &
+        meta[[count_col]] <= MAX_COUNTS &
+        meta[[feat_col]]  >= MIN_FEATURES &
+        meta[[feat_col]]  <= MAX_FEATURES
+
+if (MITO_ENABLED && !is.na(MAX_MT) && "percent.mt" %in% colnames(meta))
+  keep <- keep & (is.na(meta$percent.mt) | meta$percent.mt < MAX_MT)
+
+keep_cells <- rownames(meta)[keep]
+n_before   <- ncol(obj)
+n_removed  <- n_before - length(keep_cells)
+
+cat(sprintf("Spots before filtering: %s\n", formatC(n_before,           big.mark = ",")))
+cat(sprintf("Spots after filtering:  %s\n", formatC(length(keep_cells), big.mark = ",")))
+cat(sprintf("Spots removed:          %s (%.1f%%)\n",
+            formatC(n_removed, big.mark = ","),
+            100 * n_removed / n_before))
+
+if (length(keep_cells) < 50)
+  stop("Too few spots remain after filtering (minimum 50).")
+
+filt <- subset(obj, cells = keep_cells)
+rm(obj); gc()
+```
+
+### Post-filter QC violin plot
+
+Selects the appropriate post‑filter QC metrics, generates violin plots for them, and saves the resulting post‑filter QC panel as a PDF.
+
+```{r qc-postfilter-plot}
+post_features <- c(count_col, feat_col)
+
+# If mitochondrial QC is enabled and percent.mt exists, include it in the post‑filter QC plots
+if (MITO_ENABLED && "percent.mt" %in% colnames(filt@meta.data))
+  post_features <- c(post_features, "percent.mt")
+
+# Number of violin plot panels to display
+n_post_panels <- length(post_features)
+
+# Build post‑filter QC violin plots
+
+p_post <- VlnPlot(
+    filt,
+    features = post_features,   # QC metrics to plot
+    ncol     = n_post_panels,   # arrange in one row
+    pt.size  = 0                # hide individual points for cleaner violins
+  ) &
+  theme(
+    axis.title.x = element_blank(),          # remove x‑axis titles
+    axis.text.x  = element_blank(),          # hide x‑axis labels
+    axis.title.y = element_text(size = 9, colour = "#444")   # style y‑axis titles
+  )
+
+# Save QC plot to PDF (wider layout if 3 panels)
+ggsave(
+  file.path(OUTPUT_DIR, "plots", "02_qc_postfilter.pdf"),
+  plot   = p_post,
+  width  = if (n_post_panels == 3) 10 else 7,
+  height = 4
+)
+
+cat("Saved: 02_qc_postfilter.pdf\n")
+
+# Display inline in knitted report
+p_post
+
+```
+
+### BPCells on-disk conversion
+
+```{r qc-bpcells}
+if (BPCELLS_AVAILABLE) {
+  cat(sprintf("Converting %s spots to BPCells on-disk storage...\n",
+              formatC(ncol(filt), big.mark = ",")))
+  bpcells_dir <- file.path(OUTPUT_DIR, "rds", "bpcells_counts")
+  if (dir.exists(bpcells_dir)) unlink(bpcells_dir, recursive = TRUE)
+  mat_disk <- BPCells::write_matrix_dir(
+    mat = BPCells::convert_matrix_type(
+      GetAssayData(filt, layer = "counts"), type = "uint32_t"),
+    dir = bpcells_dir
+  )
+  filt[["RNA"]] <- SeuratObject::CreateAssayObject(counts = mat_disk)
+}
+```
+
+## Section 4 — Normalisation
+
+```{r normalisation}
+assay       <- detect_spatial_assay(filt)
+norm_method <- "normalize"
+cat("Assay:       ", assay, "\n")
+cat("Norm method: log-normalisation (NormalizeData)\n")
+
+filt <- NormalizeData(filt, verbose = FALSE)
+filt <- FindVariableFeatures(filt, selection.method = "vst",
+                              nfeatures = 3000, verbose = FALSE)
+filt <- ScaleData(filt, features = VariableFeatures(filt), verbose = FALSE)
+gc()
+
+cat(sprintf("Variable features: %d\n", length(VariableFeatures(filt))))
+```
+
+## Section 5 — PCA
+
+```{r pca}
+n_pcs_compute <- min(N_PCS_COMPUTE,
+                     ncol(filt) - 1L,
+                     length(VariableFeatures(filt)) - 1L)
+if (n_pcs_compute < 5)
+  stop("Not enough data to compute PCA (need at least 5 PCs).")
+
+cat(sprintf("Computing %d PCs...\n", n_pcs_compute))
+
+set.seed(PIPELINE_SEED)
+filt <- RunPCA(filt, npcs = n_pcs_compute,
+               features = VariableFeatures(filt), verbose = FALSE)
+```
+
+### Elbow plot
+
+```{r pca-elbow}
+# Compute % variance explained by each principal component:
+# stdev^2 gives variance; divide by total variance and convert to %
+pct_var <- filt@reductions$pca@stdev^2 /
+           sum(filt@reductions$pca@stdev^2) * 100
+
+# Number of PCs to use (set in CONFIG)
+n_pcs_use <- as.integer(N_PCS_USE)
+
+cat(sprintf("Using: %d PCs (set N_PCS_USE in CONFIG to change)\n", n_pcs_use))
+
+# Build dataframe for plotting the elbow curve
+elbow_df <- data.frame(
+  pc       = seq_along(pct_var),   # PC index
+  pct_var  = pct_var               # % variance explained
+)
+
+# Construct PCA elbow plot
+p_elbow <- ggplot(elbow_df, aes(x = pc, y = pct_var)) +
+  geom_line(colour = "#555", linewidth = 0.5) +   # line showing variance trend
+  geom_point(aes(colour = pc <= n_pcs_use),       # highlight selected PCs
+             size = 1.5) +
+  scale_colour_manual(
+    values = c("TRUE" = "#2c5f7a", "FALSE" = "#aac4d4"),
+    guide  = "none"
+  ) +
+  geom_vline(
+    xintercept = n_pcs_use,                       # vertical line at chosen PC cutoff
+    linetype   = "dashed",
+    colour     = "#2c5f7a",
+    linewidth  = 0.7
+  ) +
+  annotate(
+    "text",
+    x     = n_pcs_use + 0.5,
+    y     = max(pct_var) * 0.9,
+    label = paste0("Selected: ", n_pcs_use, " PCs"),
+    colour = "#2c5f7a",
+    hjust  = 0,
+    size   = 3.2
+  ) +
+  labs(
+    title    = "PCA Elbow Plot",
+    subtitle = "Inspect visually and set N_PCS_USE in CONFIG",
+    x        = "Principal Component",
+    y        = "% Variance Explained"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(colour = "#2c5f7a", face = "bold")
+  )
+
+# Save elbow plot to PDF
+ggsave(
+  file.path(OUTPUT_DIR, "plots", "03_elbow_plot.pdf"),
+  plot   = p_elbow,
+  width  = 7,
+  height = 4
+)
+
+cat("Saved: 03_elbow_plot.pdf\n")
+
+# Display inline in knitted report
+p_elbow
+```
+
+### Store QC Parameters and save PCA object
+
+```{r pca-save}
+filt@misc[["qc_params"]] <- list(
+  assay        = assay,
+  mc_min       = MIN_COUNTS,
+  mc_max       = MAX_COUNTS,
+  mf_min       = MIN_FEATURES,
+  mf_max       = MAX_FEATURES,
+  mt_used      = if (MITO_ENABLED) MAX_MT else NA,
+  n_before     = as.integer(n_before),
+  n_after      = ncol(filt),
+  use_sketch   = TRUE,
+  norm_method  = norm_method
+)
+
+pca_rds <- file.path(OUTPUT_DIR, "rds", "pca.rds")
+cat("Saving pca.rds...\n")
+saveRDS(filt, pca_rds)
+cat("Saved:", pca_rds)
+```
+
+## Section 6 — UMAP & Clustering
+
+### Setup
+
+```{r umap-setup}
+params     <- filt@misc[["qc_params"]]
+n_spots    <- ncol(filt)
+resolution <- RESOLUTION
+
+cat(sprintf("Spots:     %s\n", formatC(n_spots, big.mark = ",")))
+cat(sprintf("PCs used:  %d\n", n_pcs_use))
+cat(sprintf("Resolution: %.2f\n", resolution))
+```
+
+### Sketch-based clustering
+
+Sketch-based pathway (worker.R processUMAP). This block sketches a subset of cells for fast clustering and UMAP, computes clusters on the sketch, projects those results back onto all cells, and standardizes the final cluster labels.
+
+```{r umap-sketch}
+
+# Determine how many cells to sketch:
+# Use the smaller of (SKETCH_N_CELLS) or (10% of total spots)
+n_sketch <- min(SKETCH_N_CELLS, round(n_spots * 0.1))
+
+cat(sprintf("Sketching %s representative spots from %s...\n",
+            formatC(n_sketch, big.mark = ","),
+            formatC(n_spots,  big.mark = ",")))
+
+# Perform Seurat sketching (LeverageScore sampling) for fast UMAP computation
+set.seed(PIPELINE_SEED)
+filt <- SketchData(
+  object         = filt,
+  ncells         = n_sketch,          # number of cells to retain in sketch
+  method         = "LeverageScore",   # sampling method
+  sketched.assay = "sketch"           # store sketch in a new assay
+)
+
+# Switch default assay to the sketch so downstream steps use the sketched data
+DefaultAssay(filt) <- "sketch"
+
+cat("FindNeighbors + FindClusters on sketch...\n")
+
+# Build neighbour graph on the sketched PCA embedding
+set.seed(PIPELINE_SEED)
+filt <- FindNeighbors(
+  filt,
+  dims       = seq_len(n_pcs_use),    # PCA dimensions to use
+  reduction  = "pca",
+  verbose    = FALSE,
+  graph.name = c("sketch_nn", "sketch_snn")   # store graphs under sketch-specific names
+)
+
+# Cluster the sketched data using the sketch SNN graph
+filt <- FindClusters(
+  filt,
+  resolution = resolution,
+  verbose    = FALSE,
+  graph.name = "sketch_snn"
+)
+
+cat("RunUMAP on sketch (return.model = TRUE for projection)...\n")
+
+# Compute UMAP on the sketch and store the model so full data can be projected later
+set.seed(PIPELINE_SEED)
+filt <- RunUMAP(
+  filt,
+  dims         = seq_len(n_pcs_use),
+  return.model = TRUE,     # required for projecting full dataset onto sketch UMAP
+  verbose      = FALSE
+)
+```
+
+### Project to full dataset
+
+```{r umap-project}
+assay_name <- params$assay %||% "RNA"
+cat(sprintf("ProjectData to all %s spots...\n",
+            formatC(n_spots, big.mark = ",")))
+
+filt <- ProjectData(
+  object             = filt,
+  assay              = assay_name,
+  full.reduction     = "pca.full",
+  sketched.assay     = "sketch",
+  sketched.reduction = "pca",
+  umap.model         = "umap",
+  dims               = seq_len(n_pcs_use),
+  refdata            = list(cluster_full = "seurat_clusters")
+)
+DefaultAssay(filt) <- assay_name
+```
+
+### Standardise cluster column
+
+```{r umap-clusters}
+if ("cluster_full" %in% colnames(filt@meta.data)) {
+  filt@meta.data$seurat_clusters <- filt@meta.data$cluster_full
+  Idents(filt) <- "seurat_clusters"
+} else if ("predicted.cluster_full" %in% colnames(filt@meta.data)) {
+  filt@meta.data$seurat_clusters <- filt@meta.data$predicted.cluster_full
+  Idents(filt) <- "seurat_clusters"
+} else {
+  warning("ProjectData did not write cluster_full — non-sketch spots may have NA seurat_clusters")
+}
+
+# Update stored QC parameters
+existing_params                <- filt@misc[["qc_params"]] %||% list()
+existing_params$use_sketch     <- TRUE
+existing_params$n_sketch       <- n_sketch
+existing_params$n_pcs_use      <- n_pcs_use
+existing_params$resolution     <- resolution
+existing_params$cluster_method <- "sketch"
+filt@misc[["qc_params"]]       <- existing_params
+
+n_clusters <- length(unique(na.omit(as.character(filt$seurat_clusters))))
+cat(sprintf("Clusters found: %d\n", n_clusters))
+```
+
+### Update QC metadata
+
+## Section 7 — Output Plots
+
+### UMAP coloured by cluster
+
+```{r plots-umap}
+
+# Extract cluster levels in numeric order (ensures consistent colouring)
+lvls <- as.character(sort(as.numeric(
+           unique(na.omit(as.character(filt$seurat_clusters))))))
+n_cl <- length(lvls)
+
+# Generate a base colour palette with at least 3 colours
+base_cols  <- scales::hue_pal()(max(n_cl, 3))
+
+# Map each cluster level to a unique colour
+clust_cols <- setNames(base_cols[seq_len(n_cl)], lvls)
+
+# Set Seurat cluster identities to ensure plotting uses the correct factor levels
+Idents(filt) <- "seurat_clusters"
+filt$seurat_clusters <- factor(as.character(filt$seurat_clusters), levels = lvls)
+Idents(filt) <- "seurat_clusters"   # Reapply identities after relabelling
+
+# Build UMAP cluster plot
+p_umap <- DimPlot(
+    filt,
+    reduction  = "umap",     # use UMAP embedding
+    label      = TRUE,       # show cluster labels on plot
+    label.size = 3,
+    pt.size    = 0.3,
+    cols       = clust_cols  # apply consistent cluster colours
+  ) +
+  labs(
+    title    = "UMAP — Seurat Clusters",
+    subtitle = sprintf(
+      "Resolution %.2f  |  %d clusters  |  %s spots",
+      resolution, n_clusters, formatC(n_spots, big.mark = ",")
+    )
+  ) +
+  theme(
+    plot.title    = element_text(face = "bold", colour = "#2c5f7a"),
+    plot.subtitle = element_text(colour = "#666", size = 9)
+  )
+
+# Save UMAP plot to PDF
+ggsave(
+  file.path(OUTPUT_DIR, "plots", "04_umap_clusters.pdf"),
+  plot   = p_umap,
+  width  = 7,
+  height = 6
+)
+
+cat("Saved: 04_umap_clusters.pdf\n")
+
+# Display inline in knitted report
+p_umap
+```
+
+### Spatial plot coloured by cluster
+
+```{r plots-spatial, error=TRUE, fig.height=10}
+p_spatial <- tryCatch({
+
+  # Attempt to extract Visium tissue coordinates; return NULL if unavailable
+  coords <- tryCatch(GetTissueCoordinates(filt), error = function(e) NULL)
+
+  # Stop early if no spatial coordinates exist (cannot build spatial plot)
+  if (is.null(coords) || nrow(coords) == 0) stop("No tissue coordinates found.")
+
+  # Retrieve high‑resolution image scaling factor (fallback = 1 if missing)
+  sf <- tryCatch(filt@images[[1]]@scale.factors$hires / 10, error = function(e) 1)
+
+  # Build dataframe containing scaled x/y coordinates and cluster labels
+  sp_df <- data.frame(
+    cell    = rownames(coords),
+    x       =  coords[, 1] * sf,          # scale x‑coordinates
+    y       = -coords[, 2] * sf,          # invert y to match image orientation
+    cluster = factor(as.character(filt@meta.data[rownames(coords), "seurat_clusters"]),
+                     levels = lvls),      # ensure consistent cluster ordering
+    stringsAsFactors = FALSE
+  )
+
+  # Remove any spots lacking a cluster assignment
+  sp_df <- sp_df[!is.na(sp_df$cluster), , drop = FALSE]
+
+  # Attempt to extract the histology image and convert to a raster layer
+  img_layer <- if (length(filt@images) > 0) {
+    tryCatch({
+      img_data <- filt@images[[1]]@image
+      grid::rasterGrob(
+        img_data,
+        width  = grid::unit(1, "npc"),
+        height = grid::unit(1, "npc"),
+        interpolate = TRUE
+      )
+    }, error = function(e) NULL)   # If image extraction fails, skip background
+  } else NULL
+
+  # Build spatial cluster plot
+  p <- ggplot(sp_df, aes(x = x, y = y, colour = cluster)) +
+
+    # Add histology image as background if available
+    { if (!is.null(img_layer))
+        annotation_custom(
+          img_layer,
+          xmin = min(sp_df$x), xmax = max(sp_df$x),
+          ymin = min(sp_df$y), ymax = max(sp_df$y)
+        )
+    } +
+
+    # Plot each spot coloured by its Seurat cluster
+    geom_point(size = 0.8, alpha = 0.9, stroke = 0) +
+
+    # Use predefined cluster colour palette
+    scale_colour_manual(
+      values = clust_cols,
+      name   = "Cluster",
+      guide  = guide_legend(override.aes = list(size = 3, alpha = 1))
+    ) +
+
+    # Preserve spatial aspect ratio
+    coord_fixed() +
+
+    # Title and metadata summary
+    labs(
+      title    = "Spatial — Seurat Clusters",
+      subtitle = sprintf(
+        "%d clusters  |  resolution %.2f  |  %s spots",
+        n_clusters, resolution, formatC(nrow(sp_df), big.mark = ",")
+      )
+    ) +
+
+    # Remove axes and background for clean spatial view
+    theme_void() +
+    theme(
+      plot.title      = element_text(face = "bold", colour = "#2c5f7a", size = 13),
+      plot.subtitle   = element_text(colour = "#666", size = 9),
+      legend.position = "right",
+      legend.key.size = grid::unit(0.7, "cm"),
+      legend.text     = element_text(size = 9)
+    )
+
+  p   # return plot object
+
+}, error = function(e) {
+
+  # If anything fails above, print message and return NULL
+  cat("Spatial plot failed:", conditionMessage(e), "\n")
+  NULL
+})
+
+# Save plot only if successfully generated
+if (!is.null(p_spatial)) {
+  ggsave(
+    file.path(OUTPUT_DIR, "plots", "05_spatial_clusters.pdf"),
+    plot   = p_spatial,
+    width  = 10,
+    height = 9,
+    dpi    = 300
+  )
+  cat("Saved: 05_spatial_clusters.pdf\n")
+  p_spatial
+}
+```
+
+## Section 8 — Save Outputs
+
+```{r save-outputs}
+clustered_rds <- file.path(OUTPUT_DIR, "rds", "clustered.rds")
+cat("Saving clustered.rds...\n")
+saveRDS(filt, clustered_rds)
+cat("Saved:", clustered_rds, "\n")
+
+session_info_path <- file.path(OUTPUT_DIR, "session_info.txt")
+writeLines(capture.output(sessionInfo()), session_info_path)
+cat("Saved: session_info.txt\n")
+
+params_final <- filt@misc[["qc_params"]]
+cat(sprintf("  Input:           %s\n", INPUT_RDS %||% INPUT_SPACERANGER))
+cat(sprintf("  Output dir:      %s\n", normalizePath(OUTPUT_DIR, mustWork = FALSE)))
+cat(sprintf("  Spots (pre-QC):  %s\n", formatC(n_before,   big.mark = ",")))
+cat(sprintf("  Spots (post-QC): %s\n", formatC(ncol(filt), big.mark = ",")))
+cat(sprintf("  PCs used:        %d\n", n_pcs_use))
+cat(sprintf("  Resolution:      %.2f\n", resolution))
+cat(sprintf("  Clusters found:  %d\n", n_clusters))
+```
+
+## Section 9 — Concordance Validation
+
+```{r concordance, error=TRUE, fig.width=14, fig.height=5}
+if (!is.null(VALIDATION_RDS) && file.exists(VALIDATION_RDS)) {
+
+  cat("Loading validation object:", VALIDATION_RDS, "\n")
+  ref_obj      <- readRDS(VALIDATION_RDS)   # Load validated Shiny app clustering object
+  shared_cells <- intersect(colnames(filt), colnames(ref_obj))  # Spots present in both objects
+  n_shared     <- length(shared_cells)
+  cat("Shared cells:", formatC(n_shared, big.mark = ","), "\n")
+
+  # Extract cluster assignments for shared spots
+  pipeline_cl  <- as.character(filt$seurat_clusters[shared_cells])
+  ref_cl       <- as.character(ref_obj$seurat_clusters[shared_cells])
+
+  # Compute overall cluster concordance (proportion of matching labels)
+  concordance  <- mean(pipeline_cl == ref_cl)
+  cat(sprintf("Concordance: %.2f%%\n", 100 * concordance))
+
+  # UMAP panels
+  # Select appropriate UMAP reduction from each object
+  umap_name_pipe <- if ("umap"      %in% names(filt@reductions))     "umap"
+                    else if ("full.umap" %in% names(filt@reductions)) "full.umap"
+                    else names(filt@reductions)[1]
+
+  umap_name_ref  <- if ("umap"      %in% names(ref_obj@reductions))     "umap"
+                    else if ("full.umap" %in% names(ref_obj@reductions)) "full.umap"
+                    else names(ref_obj@reductions)[1]
+
+  # Extract 2D UMAP embeddings for shared cells
+  emb_pipe <- as.data.frame(Embeddings(filt,    umap_name_pipe)[shared_cells, 1:2])
+  emb_ref  <- as.data.frame(Embeddings(ref_obj, umap_name_ref )[shared_cells, 1:2])
+
+  # Standardise column names
+  colnames(emb_pipe) <- colnames(emb_ref) <- c("UMAP_1", "UMAP_2")
+
+  # Attach cluster labels for colouring
+  emb_pipe$cluster   <- pipeline_cl
+  emb_ref$cluster    <- ref_cl
+
+  # Build shared colour palette so clusters match visually
+  all_lvls <- as.character(sort(as.numeric(unique(c(pipeline_cl, ref_cl)))))
+  pal      <- setNames(scales::hue_pal()(length(all_lvls)), all_lvls)
+
+  # Pipeline UMAP plot
+  p_pipe <- ggplot(emb_pipe, aes(UMAP_1, UMAP_2, colour = cluster)) +
+    geom_point(size = 0.2, alpha = 0.5) +
+    scale_colour_manual(values = pal, name = "Cluster") +
+    labs(title = "Reproducibility Pipeline",
+         subtitle = sprintf("%s spots", formatC(n_shared, big.mark=","))) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid = element_blank(), axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          plot.title = element_text(face="bold", colour="#2c5f7a"))
+
+  # Reference UMAP plot
+  p_ref <- ggplot(emb_ref, aes(UMAP_1, UMAP_2, colour = cluster)) +
+    geom_point(size = 0.2, alpha = 0.5) +
+    scale_colour_manual(values = pal, name = "Cluster") +
+    labs(title = "Shiny App (Validated Session)",
+         subtitle = sprintf("%d clusters  |  %s spots",
+                            length(all_lvls), formatC(n_shared, big.mark=","))) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid = element_blank(), axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          plot.title = element_text(face="bold", colour="#2c5f7a"))
+
+  # Text panel summarising concordance + parameters
+  p_text <- ggplot() +
+    annotate("text", x = 0.5, y = 0.68, label = "Cluster concordance",
+             size = 3.5, colour = "#27ae60", fontface = "bold") +
+    annotate("text", x = 0.5, y = 0.52,
+             label = sprintf("%.0f%%\n(%s / %s spots)",
+                             100 * concordance,
+                             formatC(sum(pipeline_cl == ref_cl), big.mark=","),
+                             formatC(n_shared, big.mark=",")),
+             size = 4.5, colour = "#27ae60", fontface = "bold") +
+    annotate("text", x = 0.5, y = 0.22,
+             label = sprintf("Seed: %d  |  PCs: %d  |  Resolution: %.1f\nNormalisation: %s  |  Method: sketch",
+                             PIPELINE_SEED, n_pcs_use, resolution, norm_method),
+             size = 2.8, colour = "#555") +
+    theme_void() + xlim(0, 1) + ylim(0, 1)
+
+  # Save combined UMAP panel
+  umap_path <- file.path(OUTPUT_DIR, "plots", "06_concordance_umap.pdf")
+  ggsave(umap_path,
+         plot   = p_pipe + p_ref + p_text +
+                  patchwork::plot_layout(ncol = 3, widths = c(2, 2, 1.2)),
+         device = "pdf", width = 16, height = 5.5, dpi = 300)
+  cat("Saved:", umap_path, "\n")
+
+  # Confusion matrix
+  # Define consistent cluster level ordering
+  lvls  <- as.character(sort(as.numeric(unique(c(pipeline_cl, ref_cl)))))
+
+  # Build contingency table of pipeline vs reference clusters
+  cm    <- table(Pipeline = factor(pipeline_cl, levels = lvls),
+                 App      = factor(ref_cl,      levels = lvls))
+  cm_df <- as.data.frame(cm)
+
+  # Heatmap of cluster agreement
+  p_cm <- ggplot(cm_df, aes(x = App, y = Pipeline, fill = Freq)) +
+    geom_tile(colour = "white", linewidth = 0.4) +
+    geom_text(data = cm_df[cm_df$Freq > 0, ],
+              aes(label = formatC(Freq, big.mark=",")),
+              size = 2.5, colour = "white", fontface = "bold") +
+    scale_fill_gradient(low = "#f0f4f8", high = "#2c5f7a",
+                        name = "Spots", trans = "log1p",
+                        labels = scales::comma) +
+    labs(title    = sprintf("Cluster Concordance Matrix (%.0f%%)", 100 * concordance),
+         subtitle = "Pipeline (rows) vs Shiny App validated session (columns)",
+         x = "Shiny App cluster", y = "Pipeline cluster") +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid    = element_blank(),
+          axis.text     = element_text(size = 8),
+          plot.title    = element_text(face = "bold", colour = "#2c5f7a"),
+          plot.subtitle = element_text(colour = "#666", size = 8))
+
+  # Save confusion matrix
+  cm_path <- file.path(OUTPUT_DIR, "plots", "07_concordance_matrix.pdf")
+  ggsave(cm_path, plot = p_cm, device = "pdf", width = 8, height = 7, dpi = 300)
+  cat("Saved:", cm_path, "\n")
+
+  # Print final concordance summary
+  cat(sprintf("Concordance result: %.2f%% (%s/%s spots)\n",
+              100 * concordance,
+              formatC(sum(pipeline_cl == ref_cl), big.mark=","),
+              formatC(n_shared, big.mark=",")))
+
+  # Display inline in knitted report
+  (p_pipe + p_ref + p_text + patchwork::plot_layout(ncol = 3, widths = c(2, 2, 1.2)))
+
+} else {
+  # Skip section if validation file missing
+  cat("\nSection 9 skipped — VALIDATION_RDS not set or file not found.\n")
+}
+```
+
+## Section 10 — Azimuth Reproducibility Validation
+
+```{r azimuth-validation, error=TRUE, fig.width=12, fig.height=9}
+if (!is.null(AZIMUTH_APP_RDS) && file.exists(AZIMUTH_APP_RDS) &&
+    requireNamespace("Azimuth", quietly = TRUE)) {
+
+  cat("Running Azimuth on pipeline clustered object...\n")
+
+  # Switch to sequential execution — required to avoid future globals size limit
+  old_plan <- future::plan()
+  on.exit(future::plan(old_plan), add = TRUE)
+  future::plan(future::sequential)
+  options(future.globals.maxSize = +Inf)
+
+  # Join layers for Assay5 objects (Seurat v5)
+  az_obj <- filt
+  for (az_assay in intersect(Assays(az_obj), c("RNA", "Spatial"))) {
+    tryCatch({
+      if (inherits(az_obj[[az_assay]], "Assay5"))
+        az_obj <- JoinLayers(az_obj, assay = az_assay)
+    }, error = function(e) message("[azimuth] JoinLayers skipped: ", e$message))
+  }
+
+  # Run Azimuth
+  query_assay <- if ("Spatial" %in% Assays(az_obj)) "Spatial" else DefaultAssay(az_obj)
+  az_obj <- Azimuth::RunAzimuth(query = az_obj, reference = AZIMUTH_REFERENCE,
+                                 assay = query_assay, verbose = FALSE)
+  cat("Azimuth pipeline run complete.\n")
+
+  # Load validated app Azimuth results
+  cat("Loading app Azimuth results from:", AZIMUTH_APP_RDS, "\n")
+  app_az    <- readRDS(AZIMUTH_APP_RDS)
+  shared_az <- intersect(colnames(az_obj), colnames(app_az))
+  cat("Shared spots:", formatC(length(shared_az), big.mark=","), "\n")
+
+  # Helper: concordance at any Azimuth label level
+  # Arguments passed explicitly to avoid R scoping issues with az_obj/app_az
+  run_az_concordance <- function(pipeline_obj, app_obj, shared,
+                                  label_col, level_name, out_prefix, fig_num,
+                                  fig_width = 10, fig_height = 8, text_size = 8) {
+
+    if (!(label_col %in% colnames(pipeline_obj@meta.data)) ||
+        !(label_col %in% colnames(app_obj@meta.data))) {
+      cat(sprintf("Skipping %s concordance — column '%s' not found.\n",
+                  level_name, label_col))
+      return(invisible(NULL))
+    }
+
+    pipeline_l  <- as.character(pipeline_obj@meta.data[shared, label_col])
+    app_l       <- as.character(app_obj@meta.data[shared, label_col])
+    both_v      <- !is.na(pipeline_l) & !is.na(app_l)
+    n_v         <- sum(both_v)
+    concordance <- mean(pipeline_l[both_v] == app_l[both_v])
+
+    cat(sprintf("\nAzimuth %s concordance: %.2f%% (%s/%s valid spots)\n",
+                level_name, 100 * concordance,
+                formatC(sum(pipeline_l[both_v] == app_l[both_v]), big.mark=","),
+                formatC(n_v, big.mark=",")))
+
+    df <- data.frame(pipeline = pipeline_l[both_v], app = app_l[both_v],
+                     match    = pipeline_l[both_v] == app_l[both_v])
+
+    per_label <- df %>%
+      dplyr::group_by(app) %>%
+      dplyr::summarise(n_total   = dplyr::n(),
+                       n_match   = sum(match),
+                       pct_match = round(100 * mean(match), 1),
+                       .groups   = "drop") %>%
+      dplyr::arrange(dplyr::desc(pct_match))
+
+    cat(sprintf("Per-%s concordance:\n", level_name))
+    print(as.data.frame(per_label), row.names = FALSE)
+
+    write.csv(per_label,
+              file.path(OUTPUT_DIR, "plots",
+                        paste0("azimuth_", out_prefix, "_concordance.csv")),
+              row.names = FALSE)
+    cat(sprintf("Saved: azimuth_%s_concordance.csv\n", out_prefix))
+
+    cross    <- table(Pipeline = df$pipeline, App = df$app)
+    cross_df <- as.data.frame(cross) %>%
+      dplyr::group_by(App) %>%
+      dplyr::mutate(prop = Freq / sum(Freq)) %>%
+      dplyr::ungroup()
+
+    p <- ggplot(cross_df, aes(x = App, y = Pipeline, fill = prop)) +
+      geom_tile(colour = "white", linewidth = 0.3) +
+      geom_text(data = cross_df[cross_df$prop >= 0.05, ],
+                aes(label = sprintf("%.0f%%", 100 * prop)),
+                size = 2.8, colour = "white", fontface = "bold") +
+      scale_fill_gradient(low = "#f0f4f8", high = "#2c5f7a",
+                          name = "Proportion", labels = scales::percent) +
+      labs(title    = sprintf("Azimuth %s Reproducibility — %.1f%% concordance",
+                              level_name, 100 * concordance),
+           subtitle = sprintf("Row proportions: proportion of each App %s reproduced by Pipeline",
+                              level_name),
+           x = sprintf("Shiny App %s", label_col),
+           y = sprintf("Pipeline %s",  label_col)) +
+      theme_minimal(base_size = 9) +
+      theme(axis.text.x   = element_text(angle = 45, hjust = 1, size = text_size),
+            axis.text.y   = element_text(size = text_size),
+            panel.grid    = element_blank(),
+            plot.title    = element_text(face = "bold", colour = "#2c5f7a"),
+            plot.subtitle = element_text(colour = "#666", size = 8))
+
+    out_path <- file.path(OUTPUT_DIR, "plots",
+                          sprintf("%s_azimuth_%s_concordance.pdf",
+                                  fig_num, out_prefix))
+    ggsave(out_path, plot = p, device = "pdf",
+           width = fig_width, height = fig_height, dpi = 300)
+    cat("Saved:", out_path, "\n")
+
+    
+    cat(sprintf("Azimuth %s Concordance: %.2f%% (%s/%s spots)\n",
+                toupper(level_name), 100 * concordance,
+                formatC(sum(pipeline_l[both_v] == app_l[both_v]), big.mark=","),
+                formatC(n_v, big.mark=",")))
+
+    print(p)
+    invisible(concordance)
+  }
+
+  # Run at class level (GABAergic / Glutamatergic / Non-Neuronal)
+  run_az_concordance(az_obj, app_az, shared_az,
+                     "predicted.class", "class", "class",
+                     "08a", fig_width = 8, fig_height = 7)
+
+  # Run at subclass level (L5 IT, Oligo, Micro-PVM etc.)
+  run_az_concordance(az_obj, app_az, shared_az,
+                     "predicted.subclass", "subclass", "subclass",
+                     "08b", fig_width = 14, fig_height = 12, text_size = 7)
+
+} else {
+  cat("\nSection 10 skipped — AZIMUTH_APP_RDS not set, file not found, or Azimuth not installed.\n")
+}
+```
+
+## Section 11 — RCTD Reproducibility Validation
+
+```{r rctd-validation, error=TRUE, fig.width=9, fig.height=8, message=FALSE}
+if (!is.null(RCTD_APP_RDS) && file.exists(RCTD_APP_RDS) &&
+    requireNamespace("spacexr", quietly = TRUE)) {
+
+  cat("Preparing spatial data for RCTD...\n")
+
+  sp_assay  <- if ("Spatial" %in% Assays(filt)) "Spatial" else DefaultAssay(filt)
+  sp_counts <- tryCatch(
+    LayerData(filt, assay = sp_assay, layer = "counts"),
+    error = function(e) GetAssayData(filt, assay = sp_assay, slot = "counts")
+  )
+  if (!inherits(sp_counts, "dgCMatrix"))
+    sp_counts <- as(sp_counts, "CsparseMatrix")
+
+  coords    <- GetTissueCoordinates(filt)
+  coord_df  <- data.frame(x = coords[, 1], y = coords[, 2],
+                           row.names = rownames(coords))
+  shared_cells <- intersect(colnames(sp_counts), rownames(coord_df))
+  sp_counts <- sp_counts[, shared_cells, drop = FALSE]
+  coord_df  <- coord_df[shared_cells,  , drop = FALSE]
+  puck      <- spacexr::SpatialRNA(coord_df, sp_counts, colSums(sp_counts))
+  cat(sprintf("SpatialRNA: %d spots, %d genes\n", ncol(sp_counts), nrow(sp_counts)))
+
+  # Load and prepare reference
+  cat("Loading RCTD reference:", RCTD_REFERENCE, "\n")
+  ref_obj    <- readRDS(RCTD_REFERENCE)
+  ref_assay  <- if ("RNA" %in% Assays(ref_obj)) "RNA" else DefaultAssay(ref_obj)
+  ref_counts <- tryCatch(
+    LayerData(ref_obj, assay = ref_assay, layer = "counts"),
+    error = function(e) GetAssayData(ref_obj, assay = ref_assay, slot = "counts")
+  )
+  if (!inherits(ref_counts, "dgCMatrix"))
+    ref_counts <- as(ref_counts, "CsparseMatrix")
+  
+  # Takes the raw cell‑type labels from the reference object
+  cell_types_raw <- ref_obj@meta.data[[RCTD_CELL_TYPE_COL]]
+  names(cell_types_raw) <- colnames(ref_obj)
+  # Drops any cells with missing labels
+  valid_cells  <- !is.na(cell_types_raw) & nzchar(as.character(cell_types_raw))
+  # Aligns the remaining labels to the filtered count matrix
+  ref_counts   <- ref_counts[, valid_cells, drop = FALSE]
+  # Returns a clean factor of valid cell types for downstream analysis
+  cell_types   <- as.factor(cell_types_raw[valid_cells])
+
+  # Downsample to 500 cells per type (mirrors worker.R)
+  set.seed(PIPELINE_SEED)
+  keep_cells <- unlist(lapply(levels(cell_types), function(ct) {
+    idx <- which(cell_types == ct)
+    if (length(idx) > 500L) sample(idx, 500L) else idx
+  }))
+  ref_counts <- ref_counts[, keep_cells, drop = FALSE]
+  cell_types <- droplevels(cell_types[keep_cells])
+
+  # Remove types with < 25 cells
+  ct_counts  <- table(cell_types)
+  keep_types <- names(ct_counts)[ct_counts >= 25]
+  keep_ref   <- cell_types %in% keep_types
+  ref_counts <- ref_counts[, keep_ref, drop = FALSE]
+  cell_types <- droplevels(cell_types[keep_ref])
+
+  reference <- spacexr::Reference(ref_counts, cell_types, colSums(ref_counts))
+  cat(sprintf("Reference: %d cells, %d types\n",
+              ncol(ref_counts), length(levels(cell_types))))
+
+  # Run RCTD
+  cat(sprintf("Running RCTD (%s mode, %d cores)...\n", RCTD_MODE, RCTD_MAX_CORES))
+  set.seed(PIPELINE_SEED)
+  RCTD_run      <- spacexr::create.RCTD(puck, reference, max_cores = RCTD_MAX_CORES)
+  RCTD_run      <- spacexr::run.RCTD(RCTD_run, doublet_mode = RCTD_MODE)
+  pipeline_rctd <- AddMetaData(filt, metadata = RCTD_run@results$results_df)
+  cat("RCTD pipeline run complete.\n")
+
+  # Load app RCTD results and compare
+  cat("Loading app RCTD results from:", RCTD_APP_RDS, "\n")
+  app_rctd     <- readRDS(RCTD_APP_RDS)
+  shared_rctd  <- intersect(colnames(pipeline_rctd), colnames(app_rctd))
+  cat("Shared spots:", formatC(length(shared_rctd), big.mark=","), "\n")
+
+  pipeline_types   <- as.character(pipeline_rctd$first_type[shared_rctd])
+  app_types        <- as.character(app_rctd$first_type[shared_rctd])
+  both_valid_r     <- !is.na(pipeline_types) & !is.na(app_types)
+  n_valid_r        <- sum(both_valid_r)
+  rctd_concordance <- mean(pipeline_types[both_valid_r] == app_types[both_valid_r])
+
+  cat(sprintf("RCTD first_type concordance: %.2f%% (%s/%s valid spots)\n",
+              100 * rctd_concordance,
+              formatC(sum(pipeline_types[both_valid_r] == app_types[both_valid_r]),
+                      big.mark=","),
+              formatC(n_valid_r, big.mark=",")))
+
+  rctd_df <- data.frame(
+    pipeline = pipeline_types[both_valid_r],
+    app      = app_types[both_valid_r],
+    match    = pipeline_types[both_valid_r] == app_types[both_valid_r]
+  )
+
+  per_type <- rctd_df %>%
+    dplyr::group_by(app) %>%
+    dplyr::summarise(n_total   = dplyr::n(),
+                     n_match   = sum(match),
+                     pct_match = round(100 * mean(match), 1),
+                     .groups   = "drop") %>%
+    dplyr::arrange(dplyr::desc(pct_match))
+
+  cat("\nPer-type RCTD concordance:\n")
+  print(as.data.frame(per_type), row.names = FALSE)
+
+  write.csv(per_type, file.path(OUTPUT_DIR, "plots", "rctd_per_type_concordance.csv"),
+            row.names = FALSE)
+  cat("Saved: rctd_per_type_concordance.csv\n")
+
+  cross_rctd    <- table(Pipeline = rctd_df$pipeline, App = rctd_df$app)
+  cross_df_rctd <- as.data.frame(cross_rctd) %>%
+    dplyr::group_by(App) %>%
+    dplyr::mutate(prop = Freq / sum(Freq)) %>%
+    dplyr::ungroup()
+
+  p_rctd <- ggplot(cross_df_rctd, aes(x = App, y = Pipeline, fill = prop)) +
+    geom_tile(colour = "white", linewidth = 0.4) +
+    geom_text(data = cross_df_rctd[cross_df_rctd$prop >= 0.05, ],
+              aes(label = sprintf("%.0f%%", 100 * prop)),
+              size = 3, colour = "white", fontface = "bold") +
+    scale_fill_gradient(low = "#f0f4f8", high = "#2c5f7a",
+                        name = "Proportion", labels = scales::percent) +
+    labs(title    = sprintf("RCTD Reproducibility — %.1f%% concordance",
+                            100 * rctd_concordance),
+         subtitle = "Row proportions: proportion of each App cell type reproduced by Pipeline",
+         x = "Shiny App first_type", y = "Pipeline first_type") +
+    theme_minimal(base_size = 10) +
+    theme(axis.text.x   = element_text(angle = 30, hjust = 1, size = 9),
+          axis.text.y   = element_text(size = 9),
+          panel.grid    = element_blank(),
+          plot.title    = element_text(face = "bold", colour = "#2c5f7a"),
+          plot.subtitle = element_text(colour = "#666", size = 8))
+
+  rctd_path <- file.path(OUTPUT_DIR, "plots", "09_rctd_concordance.pdf")
+  ggsave(rctd_path, plot = p_rctd, device = "pdf", width = 8, height = 7, dpi = 300)
+  cat("Saved:", rctd_path, "\n")
+
+  cat(sprintf("RCTD Concordance: %.2f%% (%s/%s valid spots)\n",
+              100 * rctd_concordance,
+              formatC(sum(pipeline_types[both_valid_r] == app_types[both_valid_r]),
+                      big.mark=","),
+              formatC(n_valid_r, big.mark=",")))
+
+  p_rctd
+
+} else {
+  cat("\nSection 11 skipped — RCTD_APP_RDS not set, file not found, or spacexr not installed.\n")
+}
+```
+
+## Section 12 — BANKSY Rotation Validation
+
+```{r banksy-rotation-validation, error=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+if (isTRUE(RUN_BANKSY_ROTATION) &&
+    requireNamespace("Banksy",               quietly = TRUE) &&
+    requireNamespace("SingleCellExperiment", quietly = TRUE) &&
+    requireNamespace("SummarizedExperiment", quietly = TRUE) &&
+    requireNamespace("S4Vectors",            quietly = TRUE) &&
+    requireNamespace("plotly",               quietly = TRUE) &&
+    requireNamespace("mclust",               quietly = TRUE)) {
+
+  ROTATION_DEGREES <- BANKSY_ROTATION_DEG
+
+  cat(sprintf("Rotation: %d degrees\n", ROTATION_DEGREES))
+
+  # Helper: rotate x/y vectors around their joint centroid
+  rotate_coords_banksy <- function(x, y, degrees) {
+    deg <- as.integer(degrees) %% 360L
+    if (deg == 0L) return(list(x = x, y = y))
+    cx <- (max(x) + min(x)) / 2
+    cy <- (max(y) + min(y)) / 2
+    dx <- x - cx; dy <- y - cy
+    if (deg == 90L)  return(list(x = cx + dy,  y = cy - dx))
+    if (deg == 180L) return(list(x = cx - dx,  y = cy - dy))
+    list(x = cx - dy, y = cy + dx)  # 270
+  }
+
+  run_banksy_pipeline <- function(obj_input, label = "original",
+                                  coords_override = NULL) {
+    cat(sprintf("Running BANKSY (%s)\n", label))
+
+    obj <- obj_input
+
+    # Ensure layers are joined for Banksy
+    for (a in intersect(Assays(obj), c("RNA", "Spatial"))) {
+      tryCatch({
+        if (inherits(obj[[a]], "Assay5"))
+          obj <- JoinLayers(obj, assay = a)
+      }, error = function(e) NULL)
+    }
+
+    # Use supplied coordinates if given, else extract from the object
+    if (!is.null(coords_override)) {
+      coords <- coords_override
+    } else {
+      coords <- tryCatch(GetTissueCoordinates(obj), error = function(e) NULL)
+    }
+    if (is.null(coords) || nrow(coords) == 0)
+      stop("No tissue coordinates found on object.")
+
+    # Standardise coordinate names
+    if ("imagecol" %in% colnames(coords) && !"x" %in% colnames(coords))
+      colnames(coords)[colnames(coords) == "imagecol"] <- "x"
+    if ("imagerow" %in% colnames(coords) && !"y" %in% colnames(coords))
+      colnames(coords)[colnames(coords) == "imagerow"] <- "y"
+
+    # Match coordinates to object cells
+    shared_bc_b <- intersect(rownames(coords), colnames(obj))
+    coords      <- coords[shared_bc_b, , drop = FALSE]
+    obj_sub     <- obj[, shared_bc_b]
+
+    # Convert Seurat to SingleCellExperiment
+    assay_use <- if ("Spatial" %in% Assays(obj_sub)) "Spatial" else "RNA"
+
+    counts_mat <- tryCatch(
+      LayerData(obj_sub, assay = assay_use, layer = "counts"),
+      error = function(e) GetAssayData(obj_sub, assay = assay_use, slot = "counts")
+    )
+    if (!inherits(counts_mat, "dgCMatrix"))
+      counts_mat <- as(counts_mat, "CsparseMatrix")
+
+    norm_mat <- tryCatch(
+      LayerData(obj_sub, assay = assay_use, layer = "data"),
+      error = function(e) GetAssayData(obj_sub, assay = assay_use, slot = "data")
+    )
+    if (!inherits(norm_mat, "dgCMatrix"))
+      norm_mat <- as(norm_mat, "CsparseMatrix")
+    # computeBanksy expects coordinate columns named "sdimx" and "sdimy" by default
+    sce <- SingleCellExperiment::SingleCellExperiment(
+      assays   = list(counts = counts_mat, logcounts = norm_mat),
+      colData  = S4Vectors::DataFrame(
+        sdimx = coords[colnames(counts_mat), "x"],
+        sdimy = coords[colnames(counts_mat), "y"]
+      )
+    )
+
+    # Step 1: computeBanksy
+    set.seed(PIPELINE_SEED)
+    sce <- Banksy::computeBanksy(
+      se           = sce,
+      assay_name   = "logcounts",
+      compute_agf  = FALSE,
+      k_geom       = 6L,
+      spatial_mode = "kNN_r",
+      M            = 1L,
+      coord_names  = c("sdimx", "sdimy"),
+      verbose      = FALSE
+    )
+
+    # Step 2: runBanksyPCA
+    set.seed(PIPELINE_SEED)
+    sce <- Banksy::runBanksyPCA(
+      sce,
+      use_agf   = FALSE,
+      lambda    = BANKSY_LAMBDA,
+      npcs      = BANKSY_NPCS,
+      seed      = PIPELINE_SEED
+    )
+
+    # Step 3: clusterBanksy
+    set.seed(PIPELINE_SEED)
+    sce <- Banksy::clusterBanksy(
+      sce,
+      use_agf    = FALSE,
+      lambda     = BANKSY_LAMBDA,
+      resolution = BANKSY_RESOLUTION,
+      seed       = PIPELINE_SEED,
+      verbose    = FALSE
+    )
+
+    # Extract cluster column
+    clust_cols <- grep("^clust_", colnames(SummarizedExperiment::colData(sce)),
+                       value = TRUE)
+    if (length(clust_cols) == 0)
+      stop("No Banksy cluster column found in colData.")
+    clust_col <- clust_cols[length(clust_cols)]
+
+    clusters <- setNames(
+      as.character(SummarizedExperiment::colData(sce)[[clust_col]]),
+      colnames(sce)
+    )
+    n_cl <- length(unique(clusters))
+    cat(sprintf("  Clusters found: %d  (column: %s)\n", n_cl, clust_col))
+    clusters
+  }
+
+  # Run 1: Original coordinates
+  cl_original <- run_banksy_pipeline(filt, label = "original")
+
+  # Run 2: Rotated coordinates
+  # Rotate the coordinate table directly and pass it via coords_override,
+  # avoiding any image-slot manipulation (VisiumV2 has no @coordinates slot).
+  coords_orig <- GetTissueCoordinates(filt)
+
+  # Standardise names to x / y
+  if ("imagecol" %in% colnames(coords_orig) && !"x" %in% colnames(coords_orig))
+    colnames(coords_orig)[colnames(coords_orig) == "imagecol"] <- "x"
+  if ("imagerow" %in% colnames(coords_orig) && !"y" %in% colnames(coords_orig))
+    colnames(coords_orig)[colnames(coords_orig) == "imagerow"] <- "y"
+
+  rotated <- rotate_coords_banksy(coords_orig$x, coords_orig$y, ROTATION_DEGREES)
+
+  coords_rot <- coords_orig
+  coords_rot$x <- rotated$x
+  coords_rot$y <- rotated$y
+  cat(sprintf("Coordinates rotated by %d degrees.\n", ROTATION_DEGREES))
+
+  cl_rotated <- run_banksy_pipeline(
+    filt,
+    label           = sprintf("%d-degree rotation", ROTATION_DEGREES),
+    coords_override = coords_rot
+  )
+
+  # Step 3: Compare barcode-by-barcode
+  shared_bc <- intersect(names(cl_original), names(cl_rotated))
+  cat(sprintf("\nShared barcodes: %s\n", formatC(length(shared_bc), big.mark=",")))
+
+  orig_cl <- cl_original[shared_bc]
+  rot_cl  <- cl_rotated[shared_bc]
+
+  pct_identical <- mean(orig_cl == rot_cl) * 100
+  ari_val <- mclust::adjustedRandIndex(orig_cl, rot_cl)
+
+  cat(sprintf("Identical assignments: %.2f%% (%s/%s barcodes)\n",
+              pct_identical,
+              formatC(sum(orig_cl == rot_cl), big.mark=","),
+              formatC(length(shared_bc), big.mark=",")))
+  cat(sprintf("Adjusted Rand Index:   %.4f\n", ari_val))
+
+  # Save concordance CSV
+  concordance_df <- data.frame(
+    barcode          = shared_bc,
+    cluster_original = orig_cl,
+    cluster_rotated  = rot_cl,
+    match            = orig_cl == rot_cl,
+    stringsAsFactors = FALSE
+  )
+  conc_csv <- file.path(OUTPUT_DIR, "plots",
+                        "12_banksy_rotation_concordance.csv")
+  write.csv(concordance_df, conc_csv, row.names = FALSE)
+  cat("Saved:", conc_csv, "\n")
+
+  # Confusion heatmap
+  cross_b    <- table(Original = orig_cl, Rotated = rot_cl)
+  cross_df_b <- as.data.frame(cross_b) %>%
+    dplyr::group_by(Original) %>%
+    dplyr::mutate(prop = Freq / sum(Freq)) %>%
+    dplyr::ungroup()
+
+  lvls_b <- as.character(
+    sort(as.numeric(unique(c(as.character(cross_df_b$Original),
+                             as.character(cross_df_b$Rotated))))))
+
+  cross_df_b$Original <- factor(cross_df_b$Original, levels = lvls_b)
+  cross_df_b$Rotated  <- factor(cross_df_b$Rotated,  levels = lvls_b)
+
+  p_banksy_heat <- ggplot(cross_df_b, aes(x = Rotated, y = Original,
+                                          fill = prop)) +
+    geom_tile(colour = "white", linewidth = 0.3) +
+    geom_text(data = cross_df_b[cross_df_b$prop >= 0.05, ],
+              aes(label = sprintf("%.0f%%", 100 * prop)),
+              size = 2.8, colour = "white", fontface = "bold") +
+    scale_fill_gradient(low = "#f0f4f8", high = "#2c5f7a",
+                        name = "Proportion", labels = scales::percent) +
+    labs(title    = sprintf("BANKSY Rotation Concordance — %.1f%% identical  |  ARI = %.4f",
+                            pct_identical, ari_val),
+         subtitle = sprintf("Original (rows) vs %d°-rotated (columns) cluster assignments",
+                            ROTATION_DEGREES),
+         x = sprintf("%d° Rotated cluster", ROTATION_DEGREES),
+         y = "Original cluster") +
+    theme_minimal(base_size = 10) +
+    theme(axis.text.x   = element_text(size = 8),
+          axis.text.y   = element_text(size = 8),
+          panel.grid    = element_blank(),
+          plot.title    = element_text(face = "bold", colour = "#2c5f7a"),
+          plot.subtitle = element_text(colour = "#666", size = 8))
+
+  heat_path <- file.path(OUTPUT_DIR, "plots",
+                         "12_banksy_rotation_heatmap.pdf")
+  ggsave(heat_path, plot = p_banksy_heat,
+         device = "pdf", width = 9, height = 8, dpi = 300)
+  cat("Saved:", heat_path, "\n")
+  print(p_banksy_heat)
+
+  # Interactive Plotly Venn Diagram
+  cat("\nBuilding interactive Plotly cluster overlap diagram...\n")
+
+  orig_levels <- as.character(sort(as.numeric(unique(orig_cl))))
+  rot_levels  <- as.character(sort(as.numeric(unique(rot_cl))))
+
+  overlap_list <- list()
+  for (oc in orig_levels) {
+    for (rc in rot_levels) {
+      n <- sum(orig_cl == oc & rot_cl == rc)
+      if (n > 0) {
+        overlap_list[[length(overlap_list) + 1]] <- data.frame(
+          orig_cluster = oc,
+          rot_cluster  = rc,
+          n_barcodes   = n,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+  overlap_df <- do.call(rbind, overlap_list)
+  overlap_df$orig_num <- as.numeric(overlap_df$orig_cluster)
+  overlap_df$rot_num  <- as.numeric(overlap_df$rot_cluster)
+  overlap_df$is_diag  <- overlap_df$orig_cluster == overlap_df$rot_cluster
+
+  overlap_df$colour <- ifelse(overlap_df$is_diag, "#2c5f7a", "#e07b5a")
+  overlap_df$label  <- sprintf(
+    "Original: %s\nRotated: %s\nBarcodes: %s",
+    overlap_df$orig_cluster,
+    overlap_df$rot_cluster,
+    formatC(overlap_df$n_barcodes, big.mark = ",")
+  )
+
+  max_n <- max(overlap_df$n_barcodes)
+  overlap_df$size <- 6 + 44 * sqrt(overlap_df$n_barcodes / max_n)
+
+  # Concordance venn diagram
+  fig_venn <- plotly::plot_ly(
+    data   = overlap_df,
+    x      = ~rot_num,
+    y      = ~orig_num,
+    type   = "scatter",
+    mode   = "markers",
+    marker = list(
+      size    = ~size,
+      color   = ~colour,
+      opacity = 0.75,
+      line    = list(color = "white", width = 1)
+    ),
+    text      = ~label,
+    hoverinfo = "text"
+  ) %>%
+    plotly::layout(
+      title = list(
+        text = sprintf(
+          "<b>BANKSY Cluster Overlap: Original vs %d° Rotated</b><br><sup>Bubble size = barcode count. Teal = matched cluster. Coral = cross-cluster overlap.</sup>",
+          ROTATION_DEGREES),
+        font = list(size = 14)
+      ),
+      xaxis = list(
+        title      = sprintf("%d° Rotated cluster", ROTATION_DEGREES),
+        tickmode   = "array",
+        tickvals   = as.numeric(rot_levels),
+        ticktext   = rot_levels,
+        showgrid   = TRUE,
+        gridcolor  = "#eee"
+      ),
+      yaxis = list(
+        title      = "Original cluster",
+        tickmode   = "array",
+        tickvals   = as.numeric(orig_levels),
+        ticktext   = orig_levels,
+        showgrid   = TRUE,
+        gridcolor  = "#eee",
+        autorange  = "reversed"
+      ),
+      plot_bgcolor  = "#fafafa",
+      paper_bgcolor = "#ffffff",
+      hoverlabel    = list(
+        bgcolor  = "white",
+        font     = list(size = 12)
+      )
+    ) %>%
+    plotly::add_annotations(
+      text      = sprintf("ARI = %.4f | %.1f%% identical", ari_val, pct_identical),
+      x         = 0.5, y = -0.12,
+      xref      = "paper", yref = "paper",
+      showarrow = FALSE,
+      font      = list(size = 11, color = "#555")
+    )
+
+  print(fig_venn)
+
+  # Summary
+  cat(sprintf("BANKSY rotation validation:\n"))
+  cat(sprintf("  Rotation applied:    %d degrees\n", ROTATION_DEGREES))
+  cat(sprintf("  Shared barcodes:     %s\n",
+              formatC(length(shared_bc), big.mark=",")))
+  cat(sprintf("  Identical clusters:  %.2f%%\n", pct_identical))
+  cat(sprintf("  Adjusted Rand Index: %.4f\n",  ari_val))
+  cat(sprintf("  Interpretation:      %s\n",
+              if (ari_val > 0.99) "BANKSY is fully orientation-invariant"
+              else if (ari_val > 0.90) "Minor label permutations only"
+              else "Unexpected sensitivity to coordinate orientation"))
+
+} else {
+  cat("\nSection 12 skipped — RUN_BANKSY_ROTATION is FALSE, or Banksy/SummarizedExperiment/plotly/mclust not installed.\n")
+  cat("Install with:\n")
+  cat("  BiocManager::install(c('Banksy', 'SummarizedExperiment'))\n")
+  cat("  install.packages(c('plotly', 'mclust'))\n")
+}
+```
