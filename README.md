@@ -31,35 +31,31 @@ as evidence of the implementation only.
 
 ## Repository structure
 ├── README.md
-
 ├── LICENSE
-
 ├── main.nf                              # Nextflow pipeline: runs both arms per sample
-
 ├── nextflow.config                      # Profiles (SLURM/local), container, resources
-
 ├── submit.sh                            # SLURM submission wrapper
-
 ├── visiumhd_reproducibility_pipeline.Rmd  # Reproducibility validation
-
 ├── scripts/
-
 │   ├── phase1_cluster.R                 # Standard (expression-only) clustering arm
-
 │   ├── banksy_cluster.R                 # Spatially-aware (BANKSY) clustering arm
-
 │   ├── 00_helpers.R                     # Shared helper functions
-
 │   ├── 01_cross_sample_overview.R       # Cross-sample concordance / coherence
-
 │   ├── 02_highlight_cluster_analysis.R  # (verify name + purpose)
-
 │   └── 03_target_cluster.R              # (verify name + purpose)
-
-├── app_redacted/                        # Redacted Shiny app — evidence only, NOT runnable
-
-│   └── README.md                        # States these files are redacted / not runnable
-
+├── shiny_app/                           # Redacted Shiny app
+│   ├── analysis_module.R                # Spatial/UMAP plots, marker analysis, volcano plots
+│   ├── annotation.R                     # PanglaoDB cell type lookup
+│   ├── app.R                            # Sources all scripts to run the app
+│   ├── azimuth_module.R                 # Azimuth cell type prediction
+│   ├── export_module.R                  # Figure export, methods paragraph, save object
+│   ├── global.R                         # Shared constants, helper functions, CSS  
+│   ├── help_tab.R                       # Provides information for users
+│   ├── multi_sample_module.R            # Multi-sample loading and comparison 
+│   ├── qc_module.R                      # QC filtering, normalisation, PCA
+│   ├── queue_module.R                   # Job queue polling and status management
+│   ├── ui_server.R                      # App UI layout and main server function
+│   └── worker.R                         # Background compute worker (run independently)
 └── env/                                 # sessionInfo() records (add to back §ref in report)
 
 ---
