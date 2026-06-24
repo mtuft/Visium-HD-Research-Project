@@ -297,7 +297,7 @@ in `nextflow.config`; edit these to match your environment before running.
 
 ---
 
-## Data availability
+## Pipeline data availability
 
 This project uses publicly available Visium HD colorectal cancer data from
 Oliveira et al. (2025), *Nature Genetics*. The raw spatial data and the RCTD
@@ -316,7 +316,7 @@ container, recording the exact computational environment behind the reported res
 
 ## Citation
 
-If you use this pipeline, please cite the underlying tools:
+If you use this app, please cite the underlying tools:
 
 - **Seurat v5**: Hao et al. (2024) *Nature Methods*
 - **BANKSY**: Singhal et al. (2024) *Nature Genetics*
