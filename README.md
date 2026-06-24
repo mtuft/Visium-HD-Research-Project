@@ -33,35 +33,36 @@ as evidence of the implementation only.
 ```
 ├── README.md
 ├── LICENSE
-├── main.nf                          # Nextflow pipeline: runs both arms per sample
-├── nextflow.config                  # Profiles (SLURM/local), container, resources
-├── submit.sh                        # SLURM submission wrapper
-├── visiumhd_reproducibility_pipeline.Rmd  # Reproducibility validation
+├── main.nf                                   # Nextflow pipeline: runs both arms per sample
+├── nextflow.config                           # Profiles (SLURM/local), container, resources
+├── submit.sh                                 # SLURM submission wrapper
+├── visiumhd_reproducibility_pipeline.Rmd     # Reproducibility validation
 
 ├── scripts/
-│   ├── phase1_cluster.R             # Standard (expression-only) clustering arm
-│   ├── banksy_cluster.R             # Spatially-aware (BANKSY) clustering arm
-│   ├── 00_helpers.R                 # Shared helper functions
-│   ├── 01_cross_sample_overview.R   # Cross-sample concordance / coherence
-│   ├── 02_highlight_cluster_analysis.R  # (verify name + purpose)
-│   └── 03_target_cluster.R          # (verify name + purpose)
+│   ├── phase1_cluster.R                      # Standard (expression-only) clustering arm
+│   ├── banksy_cluster.R                      # Spatially-aware (BANKSY) clustering arm
+│   ├── 00_helpers.R                          # Shared helper functions
+│   ├── 01_cross_sample_overview.R            # Cross-sample concordance / coherence
+│   ├── 02_highlight_cluster_analysis.R       # (verify name + purpose)
+│   └── 03_target_cluster.R                   # (verify name + purpose)
 
 ├── shiny_app/
-│   ├── global.R                     # Shared constants, helper functions, CSS
-│   ├── ui_server.R                  # App UI layout and main server function
-│   ├── worker.R                     # Background compute worker (run independently)
+│   ├── global.R                              # Shared constants, helper functions, CSS
+│   ├── ui_server.R                           # App UI layout and main server function
+│   ├── worker.R                              # Background compute worker (run independently)
 │   ├── modules/
-│   │   ├── qc_module.R              # QC filtering, normalisation, PCA
-│   │   ├── analysis_module.R        # Spatial/UMAP plots, marker analysis, volcano plots
-│   │   ├── annotation_module.R      # PanglaoDB cell type lookup
-│   │   ├── azimuth_module.R         # Azimuth cell type prediction
-│   │   ├── export_module.R          # Figure export, methods paragraph, save object
-│   │   ├── queue_module.R           # Job queue polling and status management
-│   │   └── multi_sample_module.R    # Multi-sample loading and comparison
-│   ├── help_tab.R                   # Provides information for users
-│   └── app.R                        # Sources all scripts to run the app
+│   │   ├── qc_module.R                       # QC filtering, normalisation, PCA
+│   │   ├── analysis_module.R                 # Spatial/UMAP plots, marker analysis, volcano plots
+│   │   ├── annotation_module.R               # PanglaoDB cell type lookup
+│   │   ├── azimuth_module.R                  # Azimuth cell type prediction
+│   │   ├── export_module.R                   # Figure export, methods paragraph, save object
+│   │   ├── queue_module.R                    # Job queue polling and status management
+│   │   └── multi_sample_module.R             # Multi-sample loading and comparison
+│   ├── help_tab.R                            # Provides information for users
+│   └── app.R                                 # Sources all scripts to run the app
 
-└── env/                             # sessionInfo() records (add to back §ref in report)
+└── env/                                      # sessionInfo() records (add to back §ref in report)
+
 ```
 
 ---
