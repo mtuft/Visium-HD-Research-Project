@@ -1,9 +1,7 @@
 # qc_module.R
 # QC visualisation, filtering, normalisation, PCA, elbow plot, UMAP + clustering (two-step pipeline)
 #
-# NOTE: REDACTED for assessment evidence only. Implementation bodies have been
-# removed to protect proprietary logic. Function signatures, structure, and
-# descriptions are retained to document the design. This file is NOT runnable.
+# NOTE: REDACTED for assessment evidence only. Implementation bodies have been removed to protect proprietary logic. Function signatures, structure, and descriptions are retained to document the design.
 
 # UI fragment (QC tab sidebar): renders the data-source back button, normalisation
 # card, BPCells status banner, and the QC threshold panel (data summary, guidance,
