@@ -261,7 +261,7 @@ For multi-user deployments, each user session uses a unique `session_id` to name
 
 - BPCells on-disk storage: if BPCells is installed, the counts matrix is converted to on-disk format before normalisation for every dataset, keeping peak memory manageable regardless of size. All spots are retained.
 - Sketch-based clustering: by default, clustering uses leverage-score sketching for every dataset — a representative subset (10% of spots, capped at 50,000) is clustered and the labels and UMAP are projected back to all spots. No spots are discarded. (BANKSY is the opt-in spatially-aware alternative, which uses the full data up to a memory-safety limit.)
-- SCTransform is **not compatible** with BPCells on-disk storage and will be automatically switched to NormalizeData for large datasets. This is not a limitation — NormalizeData is the recommended method for Visium HD spatial data.
+- SCTransform is not compatible with BPCells on-disk storage and will be automatically switched to NormalizeData for large datasets. This is not a limitation — NormalizeData is the recommended method for Visium HD spatial data.
 
 ---
 
