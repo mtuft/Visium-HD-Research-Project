@@ -14,10 +14,10 @@ as evidence of the implementation only.
 **Fully reproducible:**
 - The Nextflow comparative-clustering pipeline (`main.nf`, `nextflow.config`, `submit.sh`)
 - The per-sample clustering scripts for both arms (`scripts/phase1_cluster.R`, `scripts/banksy_cluster.R`)
-- The cross-sample comparison and deep-dive analysis scripts (`scripts/00`–`03`)
+- The cross-sample comparison and analysis scripts (`scripts/00`–`03`)
 - The reproducibility-validation pipeline (`visiumhd_reproducibility_pipeline.Rmd`)
 
-**Redacted — evidence only, NOT runnable:**
+**Redacted — evidence only, not runnable:**
 - The interactive Shiny application (`app_redacted/`). The application is proprietary;
   the source has been redacted so that the architecture, breadth, and design are
   documented for assessment while the implementation is not reproducible. Function
