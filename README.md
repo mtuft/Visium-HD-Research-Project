@@ -43,8 +43,8 @@ as evidence of the implementation only.
 │   ├── banksy_cluster.R                      # Spatially-aware (BANKSY) clustering arm
 │   ├── 00_helpers.R                          # Shared helper functions
 │   ├── 01_cross_sample_overview.R            # Cross-sample concordance / coherence
-│   ├── 02_highlight_cluster_analysis.R       # (verify name + purpose)
-│   └── 03_target_cluster.R                   # (verify name + purpose)
+│   ├── 02_highlight_cluster_analysis.R       # Evaluates the 14 high-complexity clusters
+│   └── 03_target_cluster.R                   # Deep-dive re-clustering of flagship sample clusters
 
 ├── shiny_app/
 │   ├── global.R                              # Shared constants, helper functions, CSS
@@ -70,7 +70,7 @@ as evidence of the implementation only.
 ## App Features
 
 - **Guided QC pipeline** — interactive violin plots with live threshold feedback and real-time spot count
-- **Two normalisation methods** — NormalizeData (recommended for spatial) or SCTransform v2
+- **Optimised normalisation** — Log-normalisation (NormalizeData) is enforced as the default, avoiding the mathematical failures inherent to SCTransform on sparse, high-resolution 8µm bins.
 - **PCA with automated PC suggestion** — noise-floor algorithm identifies the elbow; elbow plot with cumulative variance display
 - **Standard and BANKSY clustering** — transcriptomics-only (Louvain) or spatially-aware clustering (BANKSY) that incorporates neighbourhood expression context
 - **Sketch-based clustering** — leverage-score subsampling for large datasets (>300K spots); auto-enabled above threshold
@@ -79,7 +79,7 @@ as evidence of the implementation only.
 - **Cluster marker analysis** — FindAllMarkers with interactive volcano plots and click-to-explore gene expression
 - **Spatial region markers** — draw any spatial selection and run differential expression against the rest of the tissue
 - **Pathway analysis** — offline GO and KEGG enrichment via clusterProfiler; no internet required after setup
-- **Cell type annotation** — Azimuth reference mapping (13 atlases) and PanglaoDB marker enrichment scoring
+- **Cell type annotation** — statistical deconvolution via RCTD (spacexr), reference mapping via Azimuth (13 atlases), and marker enrichment scoring via PanglaoDB.
 - **Custom cluster labelling** — rename clusters with free-text labels; labels propagate across all plots
 - **Multi-sample comparison** — side-by-side spatial plots, integrated UMAP, between-sample DE, and cluster composition; batch correction via Harmony or RPCA
 - **Publication-ready export** — spatial/UMAP PDFs with scale bars and auto-generated figure captions; methods paragraph and pipeline settings JSON for reproducibility; Loupe Browser CSV export
@@ -169,14 +169,14 @@ No build step is required. The app is launched directly from R.
 
 ## Running the App
 
-The app requires two processes running simultaneously: the **Shiny app** and the **background worker**. The worker handles all computationally expensive steps (normalisation, PCA, clustering, marker finding) so the UI stays responsive.
+To ensure strict reproducibility, both processes (the **Shiny app** and the **background worker**) must be run inside the Bioconductor Singularity container. The worker handles all computationally expensive steps (normalisation, PCA, clustering, marker finding) so the UI stays responsive.
 
 ### Step 1 — Start the worker
 
-Open a terminal and run:
+Open a terminal and launch the worker inside the container:
 
 ```bash
-Rscript worker.R /path/to/queue /path/to/results
+singularity exec env/bioc_3.19.sif Rscript worker.R /path/to/queue /path/to/results
 ```
 
 The worker will print `Lurking for jobs` when ready. Keep this terminal open — the worker must be running before you submit any analysis jobs from the app.
@@ -197,18 +197,18 @@ Rscript worker.R
 
 ### Step 2 — Launch the Shiny app
 
-In a second terminal (or in RStudio):
+In a second terminal (or in RStudio), launch the Shiny interface via the container:
 
 ```r
-shiny::runApp("/path/to/repo")
+singularity exec env/bioc_3.19.sif R -e 'shiny::runApp("/path/to/repo")'
 ```
 
 Or set the queue and results paths explicitly if they differ from the defaults:
 
 ```r
-Sys.setenv(VISIUMHD_QUEUE_DIR   = "/path/to/queue")
-Sys.setenv(VISIUMHD_RESULTS_DIR = "/path/to/results")
-shiny::runApp("/path/to/repo")
+export VISIUMHD_QUEUE_DIR=/path/to/queue
+export VISIUMHD_RESULTS_DIR=/path/to/results
+singularity exec env/bioc_3.19.sif R -e 'shiny::runApp("/path/to/repo")'
 ```
 
 The app will open in your browser at `http://127.0.0.1:<port>`.
@@ -265,19 +265,6 @@ For multi-user deployments, each user session uses a unique `session_id` to name
 
 ---
 
-## Citation
-
-If you use this app in your research, please cite the underlying tools:
-
-- **Seurat v5**: Hao et al. (2024) *Nature Methods*
-- **BANKSY**: Singhal et al. (2024) *Nature Genetics*
-- **Azimuth**: Hao et al. (2021) *Cell*
-- **BPCells**: Corces et al. (2024)
-- **clusterProfiler**: Wu et al. (2021) *The Innovation*
-- **Harmony**: Korsunsky et al. (2019) *Nature Methods*
-
----
-
 ## Running the pipeline
 
 On a SLURM cluster:
@@ -316,11 +303,13 @@ container, recording the exact computational environment behind the reported res
 
 ## Citation
 
-If you use this app, please cite the underlying tools:
-
+If you use this app or pipeline in your research, please cite the underlying tools:
 - **Seurat v5**: Hao et al. (2024) *Nature Methods*
 - **BANKSY**: Singhal et al. (2024) *Nature Genetics*
+- **Azimuth**: Hao et al. (2021) *Cell*
+- **BPCells**: Parks et al. (2024)
 - **RCTD (spacexr)**: Cable et al. (2022) *Nature Biotechnology*
+- **Harmony**: Korsunsky et al. (2019) *Nature Methods*
 - **clusterProfiler**: Wu et al. (2021) *The Innovation*
 - **Source dataset**: Oliveira et al. (2025) *Nature Genetics*
 
