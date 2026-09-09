@@ -9,6 +9,14 @@ as evidence of the implementation only.
 
 ---
 
+## Visium HD App
+
+<p align="center">
+  <img src="app_screenshot.png" width="800" alt="Visium HD app interface">
+</p>
+
+---
+
 ## Scope: what is and isn't in this repository
 
 **Fully reproducible:**
